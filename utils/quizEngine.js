@@ -4,7 +4,7 @@ const TIMER_SEC = parseInt(process.env.QUESTION_TIMER_SECONDS || '30');
 
 // Scoring constants
 const POINTS_CORRECT  =  1;      // +1 for correct answer
-const POINTS_WRONG    = -0.25;   // -0.25 (1/4) negative marking for wrong answer
+const POINTS_WRONG    = -0.25;   // -0.25 (1/4) negative marking
 const POINTS_SKIP     =  0;      // 0 for skipped / timeout
 
 // Active quiz sessions: Map<userId, sessionData>
@@ -14,22 +14,25 @@ const activeTimers = new Map();
 // Countdown interval trackers: Map<userId, intervalRef>
 const countdownIntervals = new Map();
 
-function createSession({ userId, questions, zone, category, examName }) {
+function createSession({ userId, questions, zone, category, subject, examName, examType, noTimer }) {
   const session = {
     userId,
     zone,
     category,
+    subject:      subject || null,
     examName,
+    examType:     examType || 'mock',   // 'mock' | 'subject' | 'retry'
+    noTimer:      noTimer || false,
     questions,
     currentIndex: 0,
-    score: 0,           // integer count of correct answers (for stats)
-    points: 0,          // float score with negative marking (+1 / -0.25)
-    wrong: 0,           // count of wrong answers
-    skipped: 0,
-    answers: [],        // { questionId, chosen, correct, timeTaken, points }
-    startTime: Date.now(),
+    score:        0,        // integer count of correct answers (for stats)
+    points:       0,        // float score with negative marking (+1 / -0.25)
+    wrong:        0,        // count of wrong answers
+    skipped:      0,
+    answers:      [],       // { questionId, chosen, correct, timeTaken, points }
+    startTime:    Date.now(),
     questionStartTime: Date.now(),
-    pollMessageIds: [], // to delete old polls
+    pollMessageIds: [],
   };
   activeSessions.set(userId, session);
   return session;
@@ -67,6 +70,7 @@ function recordAnswer(userId, chosenIndex) {
     isCorrect,
     timeTaken,
     points: pointsEarned,
+    subject: q.subject || null,
   });
   session.currentIndex++;
   return { isCorrect, explanation: q.explanation, correct: q.correct_index, pointsEarned };
@@ -85,6 +89,7 @@ function recordSkip(userId) {
     timeTaken: TIMER_SEC,
     points: POINTS_SKIP,
     skipped: true,
+    subject: q.subject || null,
   });
   session.currentIndex++;
 }
@@ -101,6 +106,7 @@ function recordTimeout(userId) {
     timeTaken: TIMER_SEC,
     points: POINTS_SKIP,
     timeout: true,
+    subject: q.subject || null,
   });
   session.currentIndex++;
 }
@@ -115,12 +121,12 @@ function getProgress(userId) {
   const session = getSession(userId);
   if (!session) return null;
   return {
-    current: session.currentIndex + 1,
-    total: session.questions.length,
-    score: session.score,       // correct count
-    wrong: session.wrong,       // wrong count
-    skipped: session.skipped,
-    points: session.points,     // float score with negative marking
+    current:  session.currentIndex + 1,
+    total:    session.questions.length,
+    score:    session.score,
+    wrong:    session.wrong,
+    skipped:  session.skipped,
+    points:   session.points,
   };
 }
 
@@ -137,18 +143,21 @@ function getSummary(userId) {
     pct >= 40 ? '🥉 Average' : '📉 Keep Practicing';
 
   return {
-    score: session.score,         // correct count (integer)
-    wrong: session.wrong,         // wrong count (integer)
-    points: session.points,       // net score after negative marking (float)
+    score:     session.score,
+    wrong:     session.wrong,
+    points:    session.points,
     total,
-    skipped: session.skipped,
+    skipped:   session.skipped,
     pct,
     grade,
     totalTime,
-    zone: session.zone,
-    category: session.category,
-    examName: session.examName,
-    answers: session.answers,
+    zone:      session.zone,
+    category:  session.category,
+    subject:   session.subject,
+    examName:  session.examName,
+    examType:  session.examType,
+    answers:   session.answers,
+    questions: session.questions,   // needed for subject analysis
   };
 }
 
@@ -167,7 +176,7 @@ function clearTimer(userId) {
   if (ref) { clearTimeout(ref); activeTimers.delete(userId); }
 }
 
-// ── Countdown interval (updates message every second) ────────
+// ── Countdown interval ────────────────────────────────────────
 
 function startCountdown(userId, onTick) {
   clearCountdown(userId);
@@ -186,7 +195,7 @@ function clearCountdown(userId) {
 }
 
 function getTimerSeconds() { return TIMER_SEC; }
-function getScoringInfo() { return { POINTS_CORRECT, POINTS_WRONG, POINTS_SKIP }; }
+function getScoringInfo()  { return { POINTS_CORRECT, POINTS_WRONG, POINTS_SKIP }; }
 
 module.exports = {
   createSession, getSession, clearSession,
