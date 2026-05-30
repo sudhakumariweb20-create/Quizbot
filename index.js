@@ -6,7 +6,7 @@ const db = require('./db/supabase');
 const { startQuiz, registerQuizHandlers } = require('./handlers/quiz');
 const { registerAdminHandlers, isAdmin, getState, handleAdminText } = require('./handlers/admin');
 // ↓↓↓ NEW IMPORT
-const { showContestMenu, registerContestHandlers } = require('./handlers/contest');
+const { showContestMenu, registerContestHandlers, startAutoTransitionCron } = require('./handlers/contest');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 bot.use(session());
@@ -65,8 +65,8 @@ bot.start(async (ctx) => {
       parse_mode: 'MarkdownV2',
       ...Markup.keyboard([
         ['🏆 Contest Zone', '📚 Exam Zone'],
-        ['⚔️ Battle Zone',  '👤 My Profile'],
-        ['💰 My Wallet',    '🏅 Leaderboard'],
+        ['👤 My Profile',   '🏅 Leaderboard'],
+        ['💰 My Wallet'],
       ]).resize(),
     }
   );
@@ -317,38 +317,12 @@ bot.hears('🏆 Contest Zone', (ctx) => showContestMenu(ctx));
 bot.command('contests', (ctx) => showContestMenu(ctx));
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BATTLE ZONE
-// ─────────────────────────────────────────────────────────────────────────────
-bot.hears('⚔️ Battle Zone', (ctx) => {
-  ctx.reply('⚔️ *Battle Zone*\n\nChallenge a friend or get randomly matched!', {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('🎯 Quick Match', 'battle_random')],
-      [Markup.button.callback('👥 Challenge Friend', 'battle_friend')],
-      [Markup.button.callback('⚔️ Start Practice Battle', 'battle_practice')],
-    ]),
-  });
-});
-bot.action('battle_random', (ctx) => {
-  ctx.answerCbQuery();
-  ctx.reply('🔍 Finding opponent... (Matchmaking coming soon!)\n\nStarting Practice Battle instead:');
-  setTimeout(() => startQuiz(ctx, { zone: 'battle', category: 'general', examName: 'Quick Battle', count: 5, mode: 'auto' }), 1000);
-});
-bot.action('battle_friend', (ctx) => {
-  ctx.answerCbQuery();
-  ctx.reply(`🔗 Share this link to challenge a friend:\n\n\`t.me/${ctx.botInfo?.username}?start=battle_${ctx.from.id}\``, { parse_mode: 'Markdown' });
-});
-bot.action('battle_practice', async (ctx) => {
-  ctx.answerCbQuery();
-  await startQuiz(ctx, { zone: 'battle', category: 'general', examName: 'Practice Battle', count: 5, mode: 'auto' });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  REGISTER ALL HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
 registerQuizHandlers(bot);
 registerAdminHandlers(bot);
-registerContestHandlers(bot);   // ← NEW
+registerContestHandlers(bot);          // ← Contest handlers
+startAutoTransitionCron();             // ← Auto live/completed transitions
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TEXT INPUT ROUTING
