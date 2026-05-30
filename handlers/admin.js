@@ -1,5 +1,7 @@
 // handlers/admin.js  —  Full admin panel for question management
 
+const { adminCreateContest, adminAssignQuestions, updateContestStatus } = require('./contest');
+
 const { Markup } = require('telegraf');
 const db = require('../db/supabase');
 
