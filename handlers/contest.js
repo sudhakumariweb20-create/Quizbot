@@ -63,7 +63,6 @@ async function getContestQuestions(contestId) {
     .eq('contest_id', contestId)
     .order('sort_order', { ascending: true });
   if (error) throw error;
-  // Return flat question objects in order
   return (data || []).map(row => row.questions);
 }
 
@@ -119,7 +118,7 @@ async function getContestLeaderboard(contestId, limit = 10) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Show contest list
+//  Show contest menu
 // ─────────────────────────────────────────────────────────────────────────────
 async function showContestMenu(ctx) {
   await ctx.reply('🏆 *Contest Zone*\n\nChoose a tab:', {
@@ -176,12 +175,28 @@ async function showContestDetail(ctx, contestId) {
   let statusLine = '';
   if (c.status === 'live') {
     const remainMin = Math.max(0, Math.round((end - now) / 60000));
-    statusLine = `⏳ Ends in: *${remainMin} min*\n👥 Competing: *${participants} students*\n`;
+    const remainSec = Math.max(0, Math.round((end - now) / 1000));
+    const liveDisplay = remainMin < 1
+      ? `${remainSec}s`
+      : remainMin > 60
+        ? `${Math.round(remainMin / 60)}h ${remainMin % 60}m`
+        : `${remainMin} min`;
+    statusLine = `⏳ Ends in: *${liveDisplay}*\n👥 Competing: *${participants} students*\n`;
   } else if (c.status === 'upcoming') {
-    const startsMin = Math.round((start - now) / 60000);
-    statusLine = `⏰ Starts in: *${startsMin > 60 ? Math.round(startsMin/60) + 'h' : startsMin + ' min'}*\n`;
+    const startsMin = Math.max(0, Math.round((start - now) / 60000));
+    const startDisplay = startsMin > 60
+      ? `${Math.round(startsMin / 60)}h ${startsMin % 60}m`
+      : `${startsMin} min`;
+    statusLine = `⏰ Starts in: *${startDisplay}*\n`;
   } else {
-    statusLine = `🏁 Contest ended\n👥 Participants: *${participants}*\n`;
+    // Completed — show when it ended, never negative
+    const endedMinsAgo = Math.round((now - end) / 60000);
+    const endedDisplay = endedMinsAgo < 60
+      ? `${endedMinsAgo} min ago`
+      : endedMinsAgo < 1440
+        ? `${Math.round(endedMinsAgo / 60)}h ago`
+        : new Date(c.end_time).toLocaleDateString('en-IN');
+    statusLine = `🏁 Contest ended: *${endedDisplay}*\n👥 Participants: *${participants}*\n`;
   }
 
   const text =
@@ -198,7 +213,6 @@ async function showContestDetail(ctx, contestId) {
   if (c.status === 'live') {
     const reg = await isRegistered(contestId, ctx.from.id).catch(() => false);
     if (reg) {
-      // Already registered — check if already submitted
       const sub = await getSubmission(contestId, ctx.from.id).catch(() => null);
       if (sub && sub.finished) {
         buttons.push([Markup.button.callback('📊 My Result', `ct_myresult_${contestId}`)]);
@@ -221,15 +235,17 @@ async function showContestDetail(ctx, contestId) {
       buttons.push([Markup.button.callback(`💳 Pay ₹${c.entry_fee} & Register`, `ct_pay_${contestId}`)]);
     }
   } else {
-    // Completed
-    buttons.push([Markup.button.callback('🏅 Final Leaderboard', `ct_leaderboard_${contestId}`)]);
+    // Completed — show results only, no register/join button
     const sub = await getSubmission(contestId, ctx.from.id).catch(() => null);
     if (sub && sub.finished) {
       buttons.push([Markup.button.callback('📊 My Result', `ct_myresult_${contestId}`)]);
+      buttons.push([Markup.button.callback('🏅 Final Leaderboard', `ct_leaderboard_${contestId}`)]);
+    } else {
+      buttons.push([Markup.button.callback('🏅 Final Leaderboard', `ct_leaderboard_${contestId}`)]);
     }
   }
 
-  buttons.push([Markup.button.callback('🔙 Back', 'ct_live')]);
+  buttons.push([Markup.button.callback('🔙 Back', 'ct_menu')]);
 
   await ctx.reply(text, {
     parse_mode: 'Markdown',
@@ -277,7 +293,6 @@ async function handleJoinAndStart(ctx, contestId) {
 async function startContestAttempt(ctx, contestId) {
   const userId = ctx.from.id;
 
-  // Clear any existing session
   clearContestSession(userId);
 
   let c, questions;
@@ -292,14 +307,12 @@ async function startContestAttempt(ctx, contestId) {
     return ctx.reply('❌ This contest has no questions assigned yet. Please contact admin.');
   }
 
-  // Check contest time window
   const now = Date.now();
   const end  = new Date(c.end_time).getTime();
   if (now >= end) {
     return ctx.reply('⏰ This contest has already ended. Check the results!');
   }
 
-  // Check if already fully submitted
   const existing = await getSubmission(contestId, userId).catch(() => null);
   if (existing && existing.finished) {
     return ctx.reply(
@@ -308,15 +321,13 @@ async function startContestAttempt(ctx, contestId) {
     );
   }
 
-  // Resume from where they left off
   const doneCount = existing ? (existing.answers || []).length : 0;
 
-  // Create session
   const session = {
     contestId,
     contestName: c.name,
     questions,
-    currentIndex: doneCount,    // resume support
+    currentIndex: doneCount,
     answers: existing ? (existing.answers || []) : [],
     contestEndTime: end,
     startTime: Date.now(),
@@ -352,22 +363,15 @@ async function startContestAttempt(ctx, contestId) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Send a contest question
-//  KEY DIFFERENCE from normal quiz:
-//   - No correct/wrong reveal after answering
-//   - No hint/explanation
-//   - Advances to next question when TIMER EXPIRES (not when user answers)
-//   - If user answers before timer, record answer + show "Answer recorded" toast
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendContestQuestion(ctx, userId) {
   const session = contestSessions.get(userId);
   if (!session) return;
 
-  // Check if all questions done
   if (session.currentIndex >= session.questions.length) {
     return finishContestAttempt(ctx, userId);
   }
 
-  // Check contest time expired
   if (Date.now() >= session.contestEndTime) {
     return finishContestAttempt(ctx, userId);
   }
@@ -383,7 +387,6 @@ async function sendContestQuestion(ctx, userId) {
       `ct_ans_${userId}_${session.contestId}_${i}`
     )]
   );
-  // No skip button in contest — but can "leave blank" by doing nothing (auto-skipped on timeout)
 
   const header =
     `🏆 *Contest: Q${qNum}/${total}*\n` +
@@ -402,12 +405,12 @@ async function sendContestQuestion(ctx, userId) {
     return;
   }
 
-  session.lastMsgId = sentMsg.message_id;
-  session.chatId    = sentMsg.chat.id;
+  session.lastMsgId  = sentMsg.message_id;
+  session.chatId     = sentMsg.chat.id;
   session.qStartTime = Date.now();
-  session.answered  = false;  // track if user already answered this question
+  session.answered   = false;
 
-  // ── Countdown ticks (update message) ──
+  // Countdown ticks
   const ticks = [25, 20, 15, 10, 5];
   const tickTimers = ticks.map(remaining => {
     const delay = (CONTEST_Q_TIMER - remaining) * 1000;
@@ -430,24 +433,21 @@ async function sendContestQuestion(ctx, userId) {
   });
   session.tickTimers = tickTimers;
 
-  // ── Hard timer: advance to next question at 30s ──
+  // Hard timer: advance after 30s
   const hardTimer = setTimeout(async () => {
     const s = contestSessions.get(userId);
     if (!s || s.currentIndex !== session.currentIndex) return;
 
-    // Clear tick timers
     (s.tickTimers || []).forEach(t => clearTimeout(t));
 
-    // If user did NOT answer — record as skipped (blank)
     if (!s.answered) {
       s.answers.push({
         qIndex: s.currentIndex,
-        chosen: -1,              // -1 = no answer
+        chosen: -1,
         timeTaken: CONTEST_Q_TIMER,
       });
     }
 
-    // Show "Time's up" message (still NO answer reveal)
     try {
       await ctx.telegram.editMessageText(
         s.chatId, s.lastMsgId, undefined,
@@ -459,9 +459,7 @@ async function sendContestQuestion(ctx, userId) {
     } catch (_) {}
 
     s.currentIndex++;
-    // Save progress to DB (so we can resume if bot restarts)
     await saveContestProgress(s).catch(() => {});
-
     setTimeout(() => sendContestQuestion(ctx, userId), 1500);
   }, CONTEST_Q_TIMER * 1000);
 
@@ -470,9 +468,6 @@ async function sendContestQuestion(ctx, userId) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Handle answer click (contest mode)
-//  → Record answer + time immediately
-//  → Do NOT reveal correct/wrong
-//  → Do NOT advance — wait for timer
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleContestAnswer(ctx, userId, contestId, chosenIndex) {
   const session = contestSessions.get(userId);
@@ -480,12 +475,10 @@ async function handleContestAnswer(ctx, userId, contestId, chosenIndex) {
   if (ctx.from.id !== userId) return ctx.answerCbQuery('Not your contest!');
   if (session.contestId !== contestId) return ctx.answerCbQuery('Wrong contest.');
 
-  // If already answered this question, ignore re-clicks
   if (session.answered) {
     return ctx.answerCbQuery('✏️ Answer already recorded!');
   }
 
-  // Record answer with time taken
   const timeTaken = Math.round((Date.now() - session.qStartTime) / 1000);
   session.answers.push({
     qIndex: session.currentIndex,
@@ -494,16 +487,13 @@ async function handleContestAnswer(ctx, userId, contestId, chosenIndex) {
   });
   session.answered = true;
 
-  // Show toast — NO reveal of correct/wrong
   await ctx.answerCbQuery('✅ Answer recorded! Wait for timer...');
 
-  // Update message to show "answered" state (still no reveal)
   const q = session.questions[session.currentIndex];
   const qNum = session.currentIndex + 1;
   const total = session.questions.length;
   const optionLabels = ['🅰️', '🅱️', '🅲️', '🅳️'];
 
-  // Remaining timer
   const elapsed = Math.round((Date.now() - session.qStartTime) / 1000);
   const remaining = Math.max(0, CONTEST_Q_TIMER - elapsed);
 
@@ -515,25 +505,22 @@ async function handleContestAnswer(ctx, userId, contestId, chosenIndex) {
       `✏️ *You answered: ${optionLabels[chosenIndex]} ${q.options[chosenIndex]}*\n` +
       `_Result will be shown after the contest ends._`,
       { parse_mode: 'Markdown' }
-      // No inline buttons — question answered
     );
   } catch (_) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Finish contest attempt (all questions done OR time up)
+//  Finish contest attempt
 // ─────────────────────────────────────────────────────────────────────────────
 async function finishContestAttempt(ctx, userId) {
   const session = contestSessions.get(userId);
   if (!session) return;
 
-  // Clear any running timers
   clearContestSession(userId);
 
   const { contestId, questions, answers, startTime } = session;
   const totalTimeSec = Math.round((Date.now() - startTime) / 1000);
 
-  // Calculate score
   let score = 0, wrong = 0, skipped = 0;
   answers.forEach(a => {
     const q = questions[a.qIndex];
@@ -545,10 +532,8 @@ async function finishContestAttempt(ctx, userId) {
       wrong++;
     }
   });
-  // Questions not reached = skipped
   skipped += (questions.length - answers.length);
 
-  // Save final submission
   try {
     await upsertSubmission(contestId, userId, {
       answers,
@@ -599,8 +584,6 @@ async function finishContestAttempt(ctx, userId) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function saveContestProgress(session) {
   const { contestId, answers } = session;
-  const userId = session.questions[0]?.userId || null; // fallback — see below
-  // We track userId separately in session
   await upsertSubmission(contestId, session._userId, {
     answers,
     finished: false,
@@ -627,15 +610,14 @@ async function showMyResult(ctx, contestId) {
     return ctx.reply('❌ You did not submit this contest.');
   }
 
-  const answers = sub.answers || [];
-  const total   = questions.length;
-  const score   = sub.score;
-  const wrong   = sub.wrong;
-  const skipped = sub.skipped;
+  const answers   = sub.answers || [];
+  const total     = questions.length;
+  const score     = sub.score;
+  const wrong     = sub.wrong;
+  const skipped   = sub.skipped;
   const netPoints = score - (wrong * 0.25);
   const accuracy  = total > 0 ? Math.round((score / total) * 100) : 0;
 
-  // Build per-question review
   let reviewText = '';
   answers.forEach((a, i) => {
     const q = questions[a.qIndex] || questions[i];
@@ -652,7 +634,6 @@ async function showMyResult(ctx, contestId) {
     reviewText += `*Q${a.qIndex + 1}.* ${status} — ⏱ ${a.timeTaken}s\n`;
   });
 
-  // Skipped (not reached)
   for (let i = answers.length; i < total; i++) {
     reviewText += `*Q${i + 1}.* ⏭ Not attempted\n`;
   }
@@ -714,7 +695,6 @@ async function showContestLeaderboard(ctx, contestId) {
     });
   }
 
-  // Prize info
   if (c.prize_pool > 0 && c.status === 'completed') {
     text += `\n💰 *Prize Pool: ₹${c.prize_pool}*\n_Top winners will be credited to their wallets._`;
   }
@@ -741,7 +721,7 @@ function clearContestSession(userId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Admin: Create contest  (admin flow — called from admin panel)
+//  Admin: Create contest
 // ─────────────────────────────────────────────────────────────────────────────
 async function adminCreateContest(ctx, data) {
   const { name, category, startTime, durationMin, questionCount, prizePool, entryFee } = data;
@@ -781,7 +761,7 @@ async function adminAssignQuestions(contestId, questionIds) {
   if (error) throw error;
 }
 
-// Update contest status (e.g. upcoming → live → completed)
+// Update contest status manually (admin override)
 async function updateContestStatus(contestId, status) {
   const { error } = await db.supabase
     .from('contests')
@@ -791,34 +771,72 @@ async function updateContestStatus(contestId, status) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  AUTO STATUS TRANSITION (runs every 60s)
+//  • upcoming  → live      when now >= start_time
+//  • live      → completed when now >= end_time
+// ─────────────────────────────────────────────────────────────────────────────
+async function runAutoTransitions() {
+  try {
+    const now = new Date().toISOString();
+
+    // upcoming → live
+    const { data: toLive } = await db.supabase
+      .from('contests')
+      .select('id, name')
+      .eq('status', 'upcoming')
+      .lte('start_time', now);
+
+    if (toLive && toLive.length > 0) {
+      for (const c of toLive) {
+        await db.supabase.from('contests').update({ status: 'live' }).eq('id', c.id);
+        console.log(`✅ Contest auto-transitioned to LIVE: [${c.id}] ${c.name}`);
+      }
+    }
+
+    // live → completed
+    const { data: toComplete } = await db.supabase
+      .from('contests')
+      .select('id, name')
+      .eq('status', 'live')
+      .lte('end_time', now);
+
+    if (toComplete && toComplete.length > 0) {
+      for (const c of toComplete) {
+        await db.supabase.from('contests').update({ status: 'completed' }).eq('id', c.id);
+        console.log(`✅ Contest auto-transitioned to COMPLETED: [${c.id}] ${c.name}`);
+      }
+    }
+  } catch (e) {
+    console.error('Auto-transition error:', e.message);
+  }
+}
+
+function startAutoTransitionCron() {
+  runAutoTransitions();
+  setInterval(runAutoTransitions, 60 * 1000);
+  console.log('🕐 Contest auto-transition cron started (every 60s)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Register all contest handlers on bot
 // ─────────────────────────────────────────────────────────────────────────────
 function registerContestHandlers(bot) {
-  // Menu
   bot.action('ct_menu', (ctx) => showContestMenu(ctx));
   bot.action('ct_registered_info', (ctx) => ctx.answerCbQuery('You are already registered! You\'ll get a reminder when it goes live.'));
 
-  // Tabs
   bot.action('ct_live',      (ctx) => showContestList(ctx, 'live'));
   bot.action('ct_upcoming',  (ctx) => showContestList(ctx, 'upcoming'));
   bot.action('ct_completed', (ctx) => showContestList(ctx, 'completed'));
 
-  // Contest detail
   bot.action(/ct_detail_(\d+)/, (ctx) => showContestDetail(ctx, parseInt(ctx.match[1])));
-
-  // Register (upcoming, free)
   bot.action(/ct_register_(\d+)/, (ctx) => handleRegister(ctx, parseInt(ctx.match[1])));
-
-  // Join & start (live, free)
   bot.action(/ct_join_(\d+)/, (ctx) => handleJoinAndStart(ctx, parseInt(ctx.match[1])));
 
-  // Resume (already registered, live)
   bot.action(/ct_start_(\d+)/, async (ctx) => {
     await ctx.answerCbQuery();
     await startContestAttempt(ctx, parseInt(ctx.match[1]));
   });
 
-  // Pay (placeholder)
   bot.action(/ct_pay_(\d+)/, (ctx) => {
     ctx.answerCbQuery();
     ctx.reply('💳 Payment integration coming soon! (Razorpay/UPI)');
@@ -832,10 +850,7 @@ function registerContestHandlers(bot) {
     await handleContestAnswer(ctx, userId, contestId, chosen);
   });
 
-  // My result
   bot.action(/ct_myresult_(\d+)/, (ctx) => showMyResult(ctx, parseInt(ctx.match[1])));
-
-  // Leaderboard
   bot.action(/ct_leaderboard_(\d+)/, (ctx) => showContestLeaderboard(ctx, parseInt(ctx.match[1])));
 }
 
@@ -846,4 +861,5 @@ module.exports = {
   adminAssignQuestions,
   updateContestStatus,
   clearContestSession,
+  startAutoTransitionCron,
 };
