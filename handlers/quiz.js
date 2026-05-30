@@ -5,6 +5,29 @@ const engine = require('../utils/quizEngine');
 const db = require('../db/supabase');
 
 const TIMER_SEC = engine.getTimerSeconds();
+const { POINTS_CORRECT, POINTS_WRONG } = engine.getScoringInfo();
+
+// Helper: build the timer bar shown in each question
+function timerBar(remaining) {
+  const total = TIMER_SEC;
+  const filled = Math.round((remaining / total) * 10);
+  const bar = '🟩'.repeat(filled) + '⬜'.repeat(10 - filled);
+  const emoji = remaining <= 5 ? '🔴' : remaining <= 10 ? '🟡' : '🟢';
+  return `${emoji} ${bar} *${remaining}s*`;
+}
+
+// Helper: build the header line shown above every question
+function buildHeader(progress, remaining) {
+  const pts = progress.points >= 0
+    ? `+${progress.points.toFixed(2)}`
+    : `${progress.points.toFixed(2)}`;
+  return (
+    `📝 *${progress.current}/${progress.total}*  ` +
+    `✅ ${progress.score}  ❌ ${progress.wrong}  ` +
+    `⭐ Score: *${pts}*\n` +
+    timerBar(remaining) + `\n\n`
+  );
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Start a quiz session
@@ -34,7 +57,9 @@ async function startQuiz(ctx, { zone, category, examName, count = 10, mode = 'au
     `🎯 *${examName}*\n\n` +
     `📝 Questions: *${questions.length}*\n` +
     `⏱ Timer: *${TIMER_SEC} seconds* per question\n` +
-    `⏭ You can skip any question\n\n` +
+    `✅ Correct: *+1 point*\n` +
+    `❌ Wrong: *−0.25 point* (negative marking)\n` +
+    `⏭ Skip: *0 points* (no penalty)\n\n` +
     `_Starting in 3 seconds..._`,
     { parse_mode: 'Markdown' }
   );
@@ -43,7 +68,7 @@ async function startQuiz(ctx, { zone, category, examName, count = 10, mode = 'au
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Send current question
+//  Send current question  (with live countdown ticker)
 // ─────────────────────────────────────────────────────────────
 async function sendQuestion(ctx, userId) {
   const session = engine.getSession(userId);
@@ -57,47 +82,75 @@ async function sendQuestion(ctx, userId) {
   const progress = engine.getProgress(userId);
   const optionLabels = ['🅰️', '🅱️', '🅲️', '🅳️'];
 
-  // Build inline keyboard with options + skip
+  // Build inline keyboard: 4 options + skip
   const optionButtons = q.options.map((opt, i) =>
     [Markup.button.callback(`${optionLabels[i]} ${opt}`, `quiz_ans_${userId}_${i}`)]
   );
-  optionButtons.push([Markup.button.callback('⏭ Skip this question', `quiz_skip_${userId}`)]);
+  optionButtons.push([Markup.button.callback('⏭ Skip  (0 pts, no penalty)', `quiz_skip_${userId}`)]);
 
-  const headerText =
-    `📝 *Question ${progress.current}/${progress.total}*  |  ✅ ${progress.score}  |  ⏭ ${progress.skipped}\n` +
-    `⏱ _You have ${TIMER_SEC} seconds_\n\n` +
-    `*${q.question}*`;
-
+  // Send initial message with full timer bar
+  const initialText = buildHeader(progress, TIMER_SEC) + `*${q.question}*`;
+  let sentMsg;
   try {
-    const sentMsg = await ctx.reply(headerText, {
+    sentMsg = await ctx.reply(initialText, {
       parse_mode: 'Markdown',
       ...Markup.inlineKeyboard(optionButtons),
     });
-
-    // Store message ID so we can edit it after answer
-    session.lastMessageId = sentMsg.message_id;
-    session.lastChatId = sentMsg.chat.id;
-    session.questionStartTime = Date.now();
-
-    // Start timer — auto move to next on timeout
-    engine.startTimer(userId, async (uid) => {
-      const s = engine.getSession(uid);
-      if (!s || s.currentIndex !== session.currentIndex) return; // already answered
-      engine.recordTimeout(uid);
-      try {
-        await ctx.telegram.editMessageText(
-          session.lastChatId,
-          session.lastMessageId,
-          undefined,
-          `⏰ *Time's up!*\n\n*${q.question}*\n\n✅ Correct: *${q.options[q.correct_index]}*\n\n📖 _${q.explanation || ''}_`,
-          { parse_mode: 'Markdown' }
-        );
-      } catch (_) {}
-      setTimeout(() => sendQuestion(ctx, uid), 2000);
-    });
   } catch (e) {
     console.error('sendQuestion error:', e.message);
+    return;
   }
+
+  session.lastMessageId  = sentMsg.message_id;
+  session.lastChatId     = sentMsg.chat.id;
+  session.questionStartTime = Date.now();
+
+  // ── Live countdown: edit message every 5 seconds ──────────
+  // (Telegram rate-limits edits; every 5s is safe and visible)
+  const tickIntervals = [25, 20, 15, 10, 5]; // seconds remaining when we update
+  const tickTimers = [];
+
+  tickIntervals.forEach((remaining) => {
+    const delay = (TIMER_SEC - remaining) * 1000;
+    const t = setTimeout(async () => {
+      const s = engine.getSession(userId);
+      // Only update if user hasn't answered yet
+      if (!s || s.currentIndex !== session.currentIndex) return;
+      const liveProgress = engine.getProgress(userId);
+      const updatedText = buildHeader(liveProgress, remaining) + `*${q.question}*`;
+      try {
+        await ctx.telegram.editMessageText(
+          session.lastChatId, session.lastMessageId, undefined,
+          updatedText,
+          { parse_mode: 'Markdown', ...Markup.inlineKeyboard(optionButtons) }
+        );
+      } catch (_) {} // ignore if already answered/deleted
+    }, delay);
+    tickTimers.push(t);
+  });
+
+  // Store tick timers so we can cancel them on answer/skip
+  session.tickTimers = tickTimers;
+
+  // ── Hard timeout at 30s ───────────────────────────────────
+  engine.startTimer(userId, async (uid) => {
+    const s = engine.getSession(uid);
+    if (!s || s.currentIndex !== session.currentIndex) return;
+    // Cancel remaining ticks
+    (s.tickTimers || []).forEach(t => clearTimeout(t));
+    engine.recordTimeout(uid);
+    try {
+      await ctx.telegram.editMessageText(
+        session.lastChatId, session.lastMessageId, undefined,
+        `⏰ *Time's up!*\n\n` +
+        `*${q.question}*\n\n` +
+        `✅ Correct: *${optionLabels[q.correct_index]} ${q.options[q.correct_index]}*\n\n` +
+        `📖 _${q.explanation || ''}_`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (_) {}
+    setTimeout(() => sendQuestion(ctx, uid), 2000);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -106,11 +159,12 @@ async function sendQuestion(ctx, userId) {
 async function handleAnswer(ctx, userId, chosenIndex) {
   const session = engine.getSession(userId);
   if (!session) return ctx.answerCbQuery('No active quiz.');
-
-  // Prevent answering a different user's quiz
   if (ctx.from.id !== userId) return ctx.answerCbQuery('This is not your quiz!');
 
+  // Cancel countdown ticks + hard timer
+  (session.tickTimers || []).forEach(t => clearTimeout(t));
   engine.clearTimer(userId);
+
   const result = engine.recordAnswer(userId, chosenIndex);
   if (!result) return ctx.answerCbQuery('No active quiz.');
 
@@ -118,12 +172,18 @@ async function handleAnswer(ctx, userId, chosenIndex) {
   const optionLabels = ['🅰️', '🅱️', '🅲️', '🅳️'];
   const isCorrect = result.isCorrect;
 
-  await ctx.answerCbQuery(isCorrect ? '✅ Correct!' : '❌ Wrong!');
+  const pointsLabel = isCorrect ? '+1 pt ⭐' : '−0.25 pt 📉';
+  await ctx.answerCbQuery(isCorrect ? `✅ Correct!  ${pointsLabel}` : `❌ Wrong!  ${pointsLabel}`);
 
-  // Edit message to show answer result
+  // Get updated progress (after recording answer)
+  const progress = engine.getProgress(userId);
+  const pts = progress.points >= 0 ? `+${progress.points.toFixed(2)}` : `${progress.points.toFixed(2)}`;
+
   try {
     const resultText =
-      `${isCorrect ? '✅' : '❌'} *${isCorrect ? 'Correct!' : 'Wrong!'}*\n\n` +
+      `${isCorrect ? '✅' : '❌'} *${isCorrect ? 'Correct! +1 pt' : 'Wrong! −0.25 pt'}*\n` +
+      `📝 *${progress.current - 1}/${progress.total}*  ` +
+      `✅ ${progress.score}  ❌ ${progress.wrong}  ⭐ Score: *${pts}*\n\n` +
       `*${q.question}*\n\n` +
       `Your answer: *${optionLabels[chosenIndex]} ${q.options[chosenIndex]}*\n` +
       (isCorrect ? '' : `✅ Correct: *${optionLabels[result.correct]} ${q.options[result.correct]}*\n`) +
@@ -132,7 +192,6 @@ async function handleAnswer(ctx, userId, chosenIndex) {
     await ctx.editMessageText(resultText, { parse_mode: 'Markdown' });
   } catch (_) {}
 
-  // Next question after 2 seconds
   setTimeout(() => sendQuestion(ctx, userId), 2000);
 }
 
@@ -145,15 +204,26 @@ async function handleSkip(ctx, userId) {
   const session = engine.getSession(userId);
   if (!session) return ctx.answerCbQuery('No active quiz.');
 
+  // Cancel countdown ticks + hard timer
+  (session.tickTimers || []).forEach(t => clearTimeout(t));
   engine.clearTimer(userId);
+
   const q = session.questions[session.currentIndex];
   engine.recordSkip(userId);
 
-  await ctx.answerCbQuery('⏭ Skipped');
+  await ctx.answerCbQuery('⏭ Skipped — no penalty');
+
+  const progress = engine.getProgress(userId);
+  const pts = progress.points >= 0 ? `+${progress.points.toFixed(2)}` : `${progress.points.toFixed(2)}`;
 
   try {
     await ctx.editMessageText(
-      `⏭ *Skipped*\n\n*${q.question}*\n\n✅ Correct answer: *${q.options[q.correct_index]}*\n\n📖 _${q.explanation || ''}_`,
+      `⏭ *Skipped* — 0 pts\n` +
+      `📝 *${progress.current - 1}/${progress.total}*  ` +
+      `✅ ${progress.score}  ❌ ${progress.wrong}  ⭐ Score: *${pts}*\n\n` +
+      `*${q.question}*\n\n` +
+      `✅ Correct answer: *${q.options[q.correct_index]}*\n\n` +
+      `📖 _${q.explanation || ''}_`,
       { parse_mode: 'Markdown' }
     );
   } catch (_) {}
@@ -184,7 +254,7 @@ async function showResults(ctx, userId) {
     await db.updateUserStats(userId, {
       quizzes_delta: 1,
       wins_delta: summary.pct >= 60 ? 1 : 0,
-      score_delta: summary.score,
+      score_delta: Math.max(0, Math.round(summary.points * 100)), // store as integer (paise style)
     });
   } catch (e) {
     console.error('Save session error:', e.message);
@@ -192,16 +262,22 @@ async function showResults(ctx, userId) {
 
   const minutes = Math.floor(summary.totalTime / 60);
   const seconds = summary.totalTime % 60;
+  const netPoints = summary.points >= 0
+    ? `+${summary.points.toFixed(2)}`
+    : `${summary.points.toFixed(2)}`;
+  const maxPoints = summary.total.toFixed(2);
 
   const text =
     `🎉 *Quiz Complete!*\n\n` +
     `📝 *${summary.examName}*\n\n` +
     `━━━━━━━━━━━━━━━━━━\n` +
-    `✅ Correct:  *${summary.score}/${summary.total}*\n` +
-    `❌ Wrong:    *${summary.total - summary.score - summary.skipped}*\n` +
-    `⏭ Skipped:  *${summary.skipped}*\n` +
-    `📊 Score:    *${summary.pct}%*\n` +
-    `⏱ Time:     *${minutes}m ${seconds}s*\n` +
+    `✅ Correct:   *${summary.score}*  (+${summary.score} pts)\n` +
+    `❌ Wrong:     *${summary.wrong}*  (−${(summary.wrong * 0.25).toFixed(2)} pts)\n` +
+    `⏭ Skipped:   *${summary.skipped}*  (0 pts)\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `⭐ Net Score:  *${netPoints} / ${maxPoints}*\n` +
+    `📊 Accuracy:  *${summary.pct}%*\n` +
+    `⏱ Time:       *${minutes}m ${seconds}s*\n` +
     `━━━━━━━━━━━━━━━━━━\n` +
     `${summary.grade}`;
 
